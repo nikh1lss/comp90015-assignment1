@@ -1,6 +1,17 @@
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -8,40 +19,34 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * SubjectServer - starter skeleton.
+ * SubjectServer - a TCP server holding the shared list of subjects.
  *
- * WHAT'S ALREADY DONE FOR YOU:
- *   - Command-line argument parsing and validation.
- *   - Reading the subject data file and decoding it as JSON.
+ * Clients connect over TCP and exchange one JSON object per line: one
+ * request line in, one response line out. The five operations (QUERY,
+ * ENROL, WITHDRAW, TRANSFER, UPDATE_CAPACITY) are dispatched from
+ * {@link #process(String)} to a handler each.
  *
- * WHAT YOU NEED TO IMPLEMENT (see the TODOs below):
- *   - Validating the decoded subject data against the rules in the
- *     Subject Data File Format section (unique subjectCode, positive
- *     capacity, enrolledStudentIds.length <= capacity), and deciding
- *     what data structure you actually want to hold subjects in for the
- *     rest of the server's life.
- *   - Everything socket-related: opening a ServerSocket, accepting
- *     connections, and handling each one.
- *   - Everything thread-related: your chosen concurrency model
- *     (thread-per-connection, thread-per-request, or a worker pool).
- *   - Your locking strategy for the concurrency requirements (per-subject
- *     read/write locks, the artificial delay placement, and the
- *     lock-ordering needed to make TRANSFER deadlock-free).
- *   - The server console (status / stop commands) and the operational
- *     log.
- *   - Persistence: writing state to disk after every successful write,
- *     and reloading it on restart instead of the original subject data
- *     file.
- *
- * None of that is scaffolded on purpose - it's the actual point of the
- * assignment. Use ProtocolMessage (see its own Javadoc) to build your
- * responses and parse incoming requests; you should not need to touch
- * SimpleJson directly.
+ * Connections are currently served one at a time on the accept thread, and
+ * the shared subject state is not yet guarded by any locking.
  *
  * Usage:
  *   java -jar SubjectServer.jar <port> <subject-data-file> <artificial-delay-ms>
  */
 public class SubjectServer {
+
+    private static final DateTimeFormatter LOG_TIMESTAMP =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+
+    /** subjectCode -> Subject. Populated once at startup and never re-keyed. */
+    private final Map<String, Subject> subjects;
+
+    /** Artificial delay applied to every operation, in milliseconds. */
+    private final int delayMs;
+
+    private SubjectServer(Map<String, Subject> subjects, int delayMs) {
+        this.subjects = subjects;
+        this.delayMs = delayMs;
+    }
 
     public static void main(String[] args) {
 
@@ -78,44 +83,272 @@ public class SubjectServer {
         Map<String, Subject> subjects = loadSubjects(subjectDataFile);
         System.out.println("Loaded " + subjects.size() + " subject(s) from " + subjectDataFile);
 
-        // TODO: Decide how `subjects` (or whatever structure you replace it
-        //       with) will be protected against concurrent access. A plain
-        //       HashMap, and the Subject objects inside it, are NOT
-        //       thread-safe on their own - see the Concurrency Requirements
-        //       section for exactly what's required here.
+        new SubjectServer(subjects, delayMs).run(port);
+    }
 
-        // TODO: Open a ServerSocket on `port`.
+    // ====================================================================
+    // Networking
+    // ====================================================================
 
-        // TODO: Start whatever you need (a thread, or a loop on this thread
-        //       before/around your accept loop) to read commands from
-        //       standard input:
-        //         status  -> print the number of active client connections
-        //         stop    -> stop accepting new connections, wait for
-        //                    in-flight operations to finish, persist final
-        //                    state, and exit cleanly
-        //       Also print one operational log line per completed
-        //       operation (timestamp, handling thread, op, subject code,
-        //       resulting status) - format is your choice.
+    /** Binds the listening socket and serves connections until it is closed. */
+    private void run(int port) {
+        ServerSocket serverSocket;
+        try {
+            serverSocket = new ServerSocket(port);
+        } catch (IOException e) {
+            System.err.println("Could not listen on port " + port + ": " + e.getMessage());
+            System.exit(1);
+            return; // unreachable, System.exit terminates the JVM
+        }
 
-        // TODO: Loop accepting client connections. For each connection,
-        //       hand it off according to your chosen concurrency model. For
-        //       each request read from a connection:
-        //         1. Read one line (one JSON message).
-        //         2. Parse it with ProtocolMessage.parse(...), catching
-        //            ProtocolException and responding INVALID_REQUEST /
-        //            ERROR without closing the connection.
-        //         3. Dispatch on request.getOp() to your handling logic for
-        //            QUERY / ENROL / WITHDRAW / TRANSFER / UPDATE_CAPACITY,
-        //            acquiring the correct lock(s) for that operation,
-        //            sleeping for `delayMs` while holding them, performing
-        //            the actual read/mutation, then releasing the lock(s)
-        //            - see "The artificial delay argument" in the spec for
-        //            the exact required ordering.
-        //         4. Persist to disk after every successful write.
-        //         5. Send back a ProtocolMessage response as one JSON line.
+        System.out.println("Listening on port " + serverSocket.getLocalPort()
+                + " with an artificial delay of " + delayMs + " ms per operation.");
 
-        System.err.println("TODO: SubjectServer networking is not implemented yet - " +
-                "see the TODO comments in main().");
+        try {
+            while (true) {
+                Socket socket = serverSocket.accept();
+                serveConnection(socket);
+            }
+        } catch (IOException e) {
+            System.err.println("Stopped accepting connections: " + e.getMessage());
+        } finally {
+            closeQuietly(serverSocket);
+        }
+    }
+
+    /**
+     * Serves one client for the lifetime of its connection: read a request
+     * line, write a response line, repeat until the client disconnects.
+     *
+     * A bad request is answered and the connection kept open; only an I/O
+     * failure or the client hanging up ends the loop.
+     */
+    private void serveConnection(Socket socket) {
+        String peer = String.valueOf(socket.getRemoteSocketAddress());
+        System.out.println("Client connected: " + peer);
+        try {
+            BufferedReader in = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            BufferedWriter out = new BufferedWriter(
+                    new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+
+            String line;
+            while ((line = in.readLine()) != null) {
+                ProtocolMessage response = process(line);
+                out.write(response.toJson());
+                out.write("\n");
+                out.flush();
+            }
+        } catch (IOException e) {
+            System.err.println("Connection to " + peer + " failed: " + e.getMessage());
+        } finally {
+            closeQuietly(socket);
+            System.out.println("Client disconnected: " + peer);
+        }
+    }
+
+    /**
+     * Turns one request line into the response to send back. Never throws:
+     * a malformed request becomes INVALID_REQUEST and anything unexpected
+     * becomes ERROR, so that the connection survives either way.
+     */
+    private ProtocolMessage process(String line) {
+        String op = "-";
+        String subjectCode = "-";
+        ProtocolMessage response;
+
+        try {
+            ProtocolMessage request = ProtocolMessage.parse(line);
+            // requireString rather than getOp so a missing "op" is reported
+            // as INVALID_REQUEST instead of reaching the switch as null.
+            op = request.requireString("op");
+
+            switch (op) {
+                case ProtocolMessage.OP_QUERY:
+                    subjectCode = request.requireString("subjectCode");
+                    response = query(subjectCode);
+                    break;
+
+                case ProtocolMessage.OP_ENROL:
+                    subjectCode = request.requireString("subjectCode");
+                    response = enrol(subjectCode, request.requireString("studentId"));
+                    break;
+
+                case ProtocolMessage.OP_WITHDRAW:
+                    subjectCode = request.requireString("subjectCode");
+                    response = withdraw(subjectCode, request.requireString("studentId"));
+                    break;
+
+                case ProtocolMessage.OP_TRANSFER: {
+                    String fromSubjectCode = request.requireString("fromSubjectCode");
+                    String toSubjectCode = request.requireString("toSubjectCode");
+                    subjectCode = fromSubjectCode + "->" + toSubjectCode;
+                    response = transfer(fromSubjectCode, toSubjectCode, request.requireString("studentId"));
+                    break;
+                }
+
+                case ProtocolMessage.OP_UPDATE_CAPACITY:
+                    subjectCode = request.requireString("subjectCode");
+                    response = updateCapacity(subjectCode, request.requireInt("newCapacity"));
+                    break;
+
+                default:
+                    response = ProtocolMessage.errorResponse(
+                            ProtocolMessage.STATUS_INVALID_REQUEST, "Unknown op: " + op);
+            }
+        } catch (ProtocolException e) {
+            response = ProtocolMessage.errorResponse(
+                    ProtocolMessage.STATUS_INVALID_REQUEST, e.getMessage());
+        } catch (RuntimeException e) {
+            response = ProtocolMessage.errorResponse(
+                    ProtocolMessage.STATUS_ERROR, "Server error: " + e);
+        }
+
+        log(op, subjectCode, response.getStatus());
+        return response;
+    }
+
+    // ====================================================================
+    // Operations
+    // ====================================================================
+
+    private ProtocolMessage query(String subjectCode) {
+        Subject subject = subjects.get(subjectCode);
+        if (subject == null) return notFound(subjectCode);
+
+        pause();
+
+        return ProtocolMessage.successResponse(ProtocolMessage.queryData(
+                subject.getSubjectCode(),
+                subject.getCapacity(),
+                subject.getEnrolledCount(),
+                new ArrayList<>(subject.getEnrolledStudentIds())));
+    }
+
+    private ProtocolMessage enrol(String subjectCode, String studentId) {
+        Subject subject = subjects.get(subjectCode);
+        if (subject == null) return notFound(subjectCode);
+
+        pause();
+
+        if (subject.getEnrolledStudentIds().contains(studentId)) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_DUPLICATE_ENROLMENT,
+                    "Student " + studentId + " is already enrolled in " + subjectCode + ".");
+        }
+        if (subject.getEnrolledCount() >= subject.getCapacity()) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_FULL,
+                    subjectCode + " is at capacity (" + subject.getCapacity() + ").");
+        }
+
+        subject.getEnrolledStudentIds().add(studentId);
+        return ProtocolMessage.successResponse();
+    }
+
+    private ProtocolMessage withdraw(String subjectCode, String studentId) {
+        Subject subject = subjects.get(subjectCode);
+        if (subject == null) return notFound(subjectCode);
+
+        pause();
+
+        if (!subject.getEnrolledStudentIds().remove(studentId)) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
+                    "Student " + studentId + " is not enrolled in " + subjectCode + ".");
+        }
+        return ProtocolMessage.successResponse();
+    }
+
+    /**
+     * Moves a student from one subject to another. The checks below run in
+     * the order the specification mandates: NOT_FOUND, INVALID_REQUEST,
+     * NOT_ENROLLED, DUPLICATE_ENROLMENT, FULL.
+     */
+    private ProtocolMessage transfer(String fromSubjectCode, String toSubjectCode, String studentId) {
+        Subject from = subjects.get(fromSubjectCode);
+        if (from == null) return notFound(fromSubjectCode);
+        Subject to = subjects.get(toSubjectCode);
+        if (to == null) return notFound(toSubjectCode);
+
+        if (fromSubjectCode.equals(toSubjectCode)) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
+                    "Cannot transfer a student from " + fromSubjectCode + " to itself.");
+        }
+
+        pause();
+
+        if (!from.getEnrolledStudentIds().contains(studentId)) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
+                    "Student " + studentId + " is not enrolled in " + fromSubjectCode + ".");
+        }
+        if (to.getEnrolledStudentIds().contains(studentId)) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_DUPLICATE_ENROLMENT,
+                    "Student " + studentId + " is already enrolled in " + toSubjectCode + ".");
+        }
+        if (to.getEnrolledCount() >= to.getCapacity()) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_FULL,
+                    toSubjectCode + " is at capacity (" + to.getCapacity() + ").");
+        }
+
+        from.getEnrolledStudentIds().remove(studentId);
+        to.getEnrolledStudentIds().add(studentId);
+        return ProtocolMessage.successResponse();
+    }
+
+    private ProtocolMessage updateCapacity(String subjectCode, int newCapacity) {
+        Subject subject = subjects.get(subjectCode);
+        if (subject == null) return notFound(subjectCode);
+
+        pause();
+
+        if (newCapacity <= 0) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
+                    "newCapacity must be a positive integer (got " + newCapacity + ").");
+        }
+        if (newCapacity < subject.getEnrolledCount()) {
+            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
+                    "newCapacity " + newCapacity + " is below the current enrolment of "
+                            + subject.getEnrolledCount() + " in " + subjectCode + ".");
+        }
+
+        subject.setCapacity(newCapacity);
+        return ProtocolMessage.successResponse();
+    }
+
+    private static ProtocolMessage notFound(String subjectCode) {
+        return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_FOUND,
+                "No such subject: " + subjectCode + ".");
+    }
+
+    // ====================================================================
+    // Helpers
+    // ====================================================================
+
+    /**
+     * The mandated artificial delay. It sits between resolving the subject(s)
+     * an operation touches and actually reading or mutating them, so that
+     * once locking is in place the delay elapses while the locks are held.
+     */
+    private void pause() {
+        if (delayMs <= 0) return;
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** One operational log line per completed operation. */
+    private static void log(String op, String subjectCode, String status) {
+        System.out.println(LocalDateTime.now().format(LOG_TIMESTAMP)
+                + " [" + Thread.currentThread().getName() + "] "
+                + op + " " + subjectCode + " -> " + status);
+    }
+
+    private static void closeQuietly(Closeable closeable) {
+        try {
+            closeable.close();
+        } catch (IOException e) {
+            // Nothing useful to do while tearing a connection down.
+        }
     }
 
     /**
@@ -123,11 +356,6 @@ public class SubjectServer {
      * subjectCode -> Subject map. Exits the process with a clear error
      * message (and non-zero status) on any failure, per the Subject Data
      * File Format section.
-     *
-     * The file reading and JSON decoding is done for you. You still need
-     * to fill in the TODO below: validating each entry against the rules
-     * the spec requires you to enforce, and constructing your Subject
-     * objects from the validated data.
      */
     private static Map<String, Subject> loadSubjects(String path) {
         String text;

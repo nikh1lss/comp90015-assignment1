@@ -1,29 +1,31 @@
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
 
 /**
- * SubjectClient - starter skeleton.
+ * SubjectClient - an interactive admin console for the subject server.
  *
- * WHAT'S ALREADY DONE FOR YOU:
- *   - Command-line argument parsing.
- *   - The interactive command loop: reading a line from standard input,
- *     splitting it into tokens, checking the argument count for each
- *     command, and printing a usage message on bad input - all without
- *     contacting the server, per the spec.
- *
- * WHAT YOU NEED TO IMPLEMENT (see the TODOs below):
- *   - Opening a socket to the server.
- *   - In each handleXxx method: building the right ProtocolMessage
- *     request, sending it as one JSON line, reading back one line of
- *     response, parsing it with ProtocolMessage.parse(...), and printing
- *     a human-readable summary. The exact wording you print is up to you.
- *   - Closing the connection cleanly on "quit".
+ * Connects to the server on startup, then reads commands from standard
+ * input one per line. Each recognised command becomes one JSON request
+ * line; the reply is read back as one JSON line and summarised for the
+ * user. Unrecognised commands are rejected locally without contacting the
+ * server.
  *
  * Usage:
  *   java -jar SubjectClient.jar <server-address> <server-port>
  */
 public class SubjectClient {
+
+    private static Socket socket;
+    private static BufferedReader serverIn;
+    private static BufferedWriter serverOut;
 
     public static void main(String[] args) {
 
@@ -45,11 +47,21 @@ public class SubjectClient {
             return;
         }
 
-        // TODO: Open a Socket to (serverAddress, serverPort) here, and set
-        //       up whatever input/output you'll use to send/receive one
-        //       JSON line per request/response. Handle connection failure
-        //       (server not reachable, etc.) gracefully.
+        // ==================== Connect to the server ====================
+        try {
+            socket = new Socket(serverAddress, serverPort);
+            serverIn = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            serverOut = new BufferedWriter(
+                    new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            System.err.println("Could not connect to " + serverAddress + ":" + serverPort
+                    + ": " + e.getMessage());
+            System.exit(1);
+            return; // unreachable, System.exit terminates the JVM
+        }
 
+        System.out.println("Connected to " + serverAddress + ":" + serverPort + ".");
         System.out.println("Type a command: query | enrol | withdraw | transfer | update | quit");
 
         // ==================== Interactive command loop (provided) ====================
@@ -90,7 +102,6 @@ public class SubjectClient {
                         break;
 
                     case "quit":
-                        // TODO: close your socket/streams here before returning.
                         System.out.println("Goodbye.");
                         return;
 
@@ -101,6 +112,25 @@ public class SubjectClient {
             }
         } catch (IOException e) {
             System.err.println("Error reading from standard input: " + e.getMessage());
+        } finally {
+            // Covers "quit", end of input, and a failure of standard input.
+            disconnect();
+        }
+    }
+
+    /** Closes the connection to the server, if it is still open. */
+    private static void disconnect() {
+        closeQuietly(serverOut);
+        closeQuietly(serverIn);
+        closeQuietly(socket);
+    }
+
+    private static void closeQuietly(Closeable closeable) {
+        if (closeable == null) return;
+        try {
+            closeable.close();
+        } catch (IOException e) {
+            // Nothing useful to do while tearing the connection down.
         }
     }
 
@@ -109,33 +139,69 @@ public class SubjectClient {
     }
 
     // ====================================================================
-    // TODO: implement each of these. In each one you should:
-    //   1. Build the request, e.g. ProtocolMessage.queryRequest(subjectCode)
-    //   2. Send request.toJson() followed by a newline to the server, and
-    //      flush the stream.
-    //   3. Read one line back from the server.
-    //   4. Parse it with ProtocolMessage.parse(line).
-    //   5. Print a human-readable summary based on the response's status
-    //      (and, for QUERY, its data).
-    // Handle IOException / ProtocolException here too - a network error or
-    // a malformed response from the server should be reported to the user,
-    // not crash the client.
+    // Commands
     // ====================================================================
 
     private static void handleQuery(String subjectCode) {
-        // TODO
+        ProtocolMessage response = exchange(ProtocolMessage.queryRequest(subjectCode));
+        if (response == null) return;
+
+        if (!isSuccess(response)) {
+            printFailure(response);
+            return;
+        }
+
+        Map<String, Object> data = response.getData();
+        if (data == null) {
+            System.out.println("Server returned no data for " + subjectCode + ".");
+            return;
+        }
+
+        System.out.println(data.get("subjectCode")
+                + ": " + data.get("enrolledCount") + "/" + data.get("capacity") + " enrolled");
+        Object ids = data.get("enrolledStudentIds");
+        if (ids instanceof List && !((List<?>) ids).isEmpty()) {
+            for (Object id : (List<?>) ids) {
+                System.out.println("  " + id);
+            }
+        } else {
+            System.out.println("  (nobody enrolled)");
+        }
     }
 
     private static void handleEnrol(String subjectCode, String studentId) {
-        // TODO
+        ProtocolMessage response = exchange(ProtocolMessage.enrolRequest(subjectCode, studentId));
+        if (response == null) return;
+
+        if (isSuccess(response)) {
+            System.out.println("Enrolled " + studentId + " in " + subjectCode + ".");
+        } else {
+            printFailure(response);
+        }
     }
 
     private static void handleWithdraw(String subjectCode, String studentId) {
-        // TODO
+        ProtocolMessage response = exchange(ProtocolMessage.withdrawRequest(subjectCode, studentId));
+        if (response == null) return;
+
+        if (isSuccess(response)) {
+            System.out.println("Withdrew " + studentId + " from " + subjectCode + ".");
+        } else {
+            printFailure(response);
+        }
     }
 
     private static void handleTransfer(String fromSubjectCode, String toSubjectCode, String studentId) {
-        // TODO
+        ProtocolMessage response = exchange(
+                ProtocolMessage.transferRequest(fromSubjectCode, toSubjectCode, studentId));
+        if (response == null) return;
+
+        if (isSuccess(response)) {
+            System.out.println("Transferred " + studentId + " from " + fromSubjectCode
+                    + " to " + toSubjectCode + ".");
+        } else {
+            printFailure(response);
+        }
     }
 
     private static void handleUpdateCapacity(String subjectCode, String newCapacityStr) {
@@ -146,7 +212,60 @@ public class SubjectClient {
             System.out.println("newCapacity must be an integer.");
             return;
         }
-        // TODO: build ProtocolMessage.updateCapacityRequest(subjectCode, newCapacity),
-        //       send it, read the response, and print a summary.
+
+        ProtocolMessage response = exchange(
+                ProtocolMessage.updateCapacityRequest(subjectCode, newCapacity));
+        if (response == null) return;
+
+        if (isSuccess(response)) {
+            System.out.println("Capacity of " + subjectCode + " is now " + newCapacity + ".");
+        } else {
+            printFailure(response);
+        }
+    }
+
+    // ====================================================================
+    // Talking to the server
+    // ====================================================================
+
+    /**
+     * Sends one request line and reads one response line back. Returns null
+     * if the exchange failed, having already told the user why: a network
+     * error, a server that hung up, or a reply that would not parse.
+     */
+    private static ProtocolMessage exchange(ProtocolMessage request) {
+        try {
+            serverOut.write(request.toJson());
+            serverOut.write("\n");
+            serverOut.flush();
+
+            String line = serverIn.readLine();
+            if (line == null) {
+                System.out.println("The server closed the connection. Type 'quit' to exit.");
+                return null;
+            }
+            return ProtocolMessage.parse(line);
+        } catch (IOException e) {
+            System.out.println("Could not reach the server: " + e.getMessage());
+            return null;
+        } catch (ProtocolException e) {
+            System.out.println("Unreadable reply from the server: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static boolean isSuccess(ProtocolMessage response) {
+        return ProtocolMessage.STATUS_SUCCESS.equals(response.getStatus());
+    }
+
+    /** Prints a non-SUCCESS response as "STATUS: message". */
+    private static void printFailure(ProtocolMessage response) {
+        String status = response.getStatus();
+        String message = response.getString("message");
+        if (status == null) {
+            System.out.println("Unreadable reply from the server: no status field.");
+            return;
+        }
+        System.out.println(status + (message == null ? "" : ": " + message));
     }
 }
