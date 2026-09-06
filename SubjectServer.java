@@ -2,8 +2,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * SubjectServer - starter skeleton.
@@ -154,30 +156,96 @@ public class SubjectServer {
 
         Map<String, Subject> subjects = new HashMap<>();
 
+        int index = 0;
         for (Object item : (List<?>) decoded) {
+            String where = "Entry " + index + " of subject data file '" + path + "'";
+            index++;
+
             if (!(item instanceof Map)) {
-                System.err.println("Every entry in '" + path + "' must be a JSON object.");
-                System.exit(1);
-                return null; // unreachable
+                fail(where + " is not a JSON object.");
             }
             @SuppressWarnings("unchecked")
             Map<String, Object> entry = (Map<String, Object>) item;
 
-            // TODO: Validate `entry` against the rules in the Subject Data
-            //       File Format section, printing a clear message and
-            //       calling System.exit(1) if any rule is violated:
-            //         - subjectCode must be present, a string, and unique
-            //           across the whole file (check against `subjects`,
-            //           which already holds everything parsed so far).
-            //         - capacity must be present and a positive integer.
-            //         - enrolledStudentIds must be present, an array of
-            //           strings, with length <= capacity.
-            //
-            //       Once validated, construct your Subject and add it:
-            //         Subject subject = new Subject(subjectCode, capacity, enrolledIds);
-            //         subjects.put(subjectCode, subject);
+            // --- subjectCode: present, a non-empty string, unique in the file ---
+            Object rawCode = entry.get("subjectCode");
+            if (!(rawCode instanceof String) || ((String) rawCode).trim().isEmpty()) {
+                fail(where + ": 'subjectCode' must be a non-empty string (got " + describe(rawCode) + ").");
+            }
+            String subjectCode = (String) rawCode;
+            if (subjects.containsKey(subjectCode)) {
+                fail(where + ": duplicate subjectCode '" + subjectCode + "'; subject codes must be unique.");
+            }
+
+            // --- capacity: present and a positive integer ---
+            Object rawCapacity = entry.get("capacity");
+            Integer capacityValue = asWholeNumber(rawCapacity);
+            if (capacityValue == null || capacityValue <= 0) {
+                fail(where + ": 'capacity' must be a positive integer (got " + describe(rawCapacity) + ").");
+            }
+            int capacity = capacityValue;
+
+            // --- enrolledStudentIds: an array of strings, no longer than capacity ---
+            Object rawIds = entry.get("enrolledStudentIds");
+            if (!(rawIds instanceof List)) {
+                fail(where + ": 'enrolledStudentIds' must be a JSON array (got " + describe(rawIds) + ").");
+            }
+            List<?> rawIdList = (List<?>) rawIds;
+            if (rawIdList.size() > capacity) {
+                fail(where + ": 'enrolledStudentIds' has " + rawIdList.size()
+                        + " entries, which exceeds the capacity of " + capacity + ".");
+            }
+
+            Set<String> enrolledStudentIds = new LinkedHashSet<>();
+            for (Object rawId : rawIdList) {
+                if (!(rawId instanceof String) || ((String) rawId).trim().isEmpty()) {
+                    fail(where + ": every entry in 'enrolledStudentIds' must be a non-empty string (got "
+                            + describe(rawId) + ").");
+                }
+                enrolledStudentIds.add((String) rawId);
+            }
+
+            subjects.put(subjectCode, new Subject(subjectCode, capacity, enrolledStudentIds));
         }
 
         return subjects;
+    }
+
+    /**
+     * Reports a fatal subject data file problem and terminates the JVM with a
+     * non-zero status, as the Subject Data File Format section requires.
+     */
+    private static void fail(String message) {
+        System.err.println(message);
+        System.exit(1);
+    }
+
+    /**
+     * Returns the given decoded JSON value as an Integer if it is a whole
+     * number, or null if it is absent or not a whole number. SimpleJson
+     * decodes numbers as Long, or Double when they have a fractional part or
+     * exponent, so both are considered here (matching ProtocolMessage.getInt).
+     */
+    private static Integer asWholeNumber(Object value) {
+        if (value instanceof Long) {
+            long l = (Long) value;
+            if (l < Integer.MIN_VALUE || l > Integer.MAX_VALUE) return null;
+            return (int) l;
+        }
+        if (value instanceof Double) {
+            double d = (Double) value;
+            if (d == Math.floor(d) && !Double.isInfinite(d)
+                    && d >= Integer.MIN_VALUE && d <= Integer.MAX_VALUE) {
+                return (int) d;
+            }
+        }
+        return null;
+    }
+
+    /** Renders a decoded JSON value for inclusion in an error message. */
+    private static String describe(Object value) {
+        if (value == null) return "nothing";
+        if (value instanceof String) return "\"" + value + "\"";
+        return String.valueOf(value);
     }
 }
