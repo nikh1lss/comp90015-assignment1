@@ -1,5 +1,6 @@
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Subject - a plain in-memory representation of one subject's data.
@@ -15,16 +16,22 @@ import java.util.Set;
  * underlying data structure if you prefer a different one, as long as
  * your server behaves as the Functional Requirements section describes.
  *
- * This class is NOT thread-safe on its own. Any code that reads or
- * mutates a Subject concurrently from multiple threads must use your own
- * locking to do so safely - that is true whether you keep this class as
- * given or modify it.
+ * The fields of this class are NOT thread-safe on their own. Each Subject
+ * therefore carries its own ReentrantReadWriteLock, obtained from
+ * getLock(): every read of its state must hold the read lock and every
+ * mutation must hold the write lock. Keeping the lock on the subject it
+ * guards makes the granularity explicit - one lock per subject, so work on
+ * different subjects never contends - and means a caller cannot pick up
+ * the wrong lock for the subject it is about to touch.
  */
 public class Subject {
 
     private String subjectCode;
     private int capacity;
     private final Set<String> enrolledStudentIds;
+
+    /** Guards capacity and enrolledStudentIds. See getLock(). */
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     public Subject(String subjectCode, int capacity) {
         this.subjectCode = subjectCode;
@@ -36,6 +43,16 @@ public class Subject {
         this.subjectCode = subjectCode;
         this.capacity = capacity;
         this.enrolledStudentIds = new LinkedHashSet<>(initialEnrolledStudentIds);
+    }
+
+    /**
+     * This subject's lock. Hold the read lock while reading capacity or the
+     * enrolled set, and the write lock while changing either. Readers of one
+     * subject do not block each other; a writer excludes everything else on
+     * that same subject.
+     */
+    public ReentrantReadWriteLock getLock() {
+        return lock;
     }
 
     public String getSubjectCode() {

@@ -17,6 +17,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.locks.Lock;
 
 /**
  * SubjectServer - a TCP server holding the shared list of subjects.
@@ -27,8 +28,12 @@ import java.util.Set;
  * {@link #process(String)} to a handler each.
  *
  * Each accepted connection is handed to its own thread, which serves that
- * client until it disconnects (thread-per-connection). The shared subject
- * state is not yet guarded by any locking.
+ * client until it disconnects (thread-per-connection). Shared state is
+ * guarded one subject at a time: every Subject carries its own
+ * ReentrantReadWriteLock, so QUERYs on a subject run together, a write on
+ * a subject excludes everything else on it, and work on different subjects
+ * never contends. TRANSFER takes both write locks in ascending subjectCode
+ * order so that opposing transfers cannot deadlock.
  *
  * Usage:
  *   java -jar SubjectServer.jar <port> <subject-data-file> <artificial-delay-ms>
@@ -38,7 +43,13 @@ public class SubjectServer {
     private static final DateTimeFormatter LOG_TIMESTAMP =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
-    /** subjectCode -> Subject. Populated once at startup and never re-keyed. */
+    /**
+     * subjectCode -> Subject. Fully populated before the first handler
+     * thread starts and never re-keyed afterwards, so lookups need no lock
+     * of their own; Thread.start() publishes it safely to every handler.
+     * The mutable state inside each Subject is what the per-subject locks
+     * guard.
+     */
     private final Map<String, Subject> subjects;
 
     /** Artificial delay applied to every operation, in milliseconds. */
@@ -398,51 +409,81 @@ public class SubjectServer {
         Subject subject = subjects.get(subjectCode);
         if (subject == null) return notFound(subjectCode);
 
-        pause();
-
-        return ProtocolMessage.successResponse(ProtocolMessage.queryData(
-                subject.getSubjectCode(),
-                subject.getCapacity(),
-                subject.getEnrolledCount(),
-                new ArrayList<>(subject.getEnrolledStudentIds())));
+        Lock readLock = subject.getLock().readLock();
+        readLock.lock();
+        try {
+            pause();
+            return ProtocolMessage.successResponse(ProtocolMessage.queryData(
+                    subject.getSubjectCode(),
+                    subject.getCapacity(),
+                    subject.getEnrolledCount(),
+                    new ArrayList<>(subject.getEnrolledStudentIds())));
+        } finally {
+            readLock.unlock();
+        }
     }
 
+    /**
+     * Checking for a free seat and taking it happen under the same write
+     * lock, so two clients racing for a single remaining seat cannot both
+     * succeed: the loser sees the updated count and gets FULL.
+     */
     private ProtocolMessage enrol(String subjectCode, String studentId) {
         Subject subject = subjects.get(subjectCode);
         if (subject == null) return notFound(subjectCode);
 
-        pause();
+        Lock writeLock = subject.getLock().writeLock();
+        writeLock.lock();
+        try {
+            pause();
 
-        if (subject.getEnrolledStudentIds().contains(studentId)) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_DUPLICATE_ENROLMENT,
-                    "Student " + studentId + " is already enrolled in " + subjectCode + ".");
-        }
-        if (subject.getEnrolledCount() >= subject.getCapacity()) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_FULL,
-                    subjectCode + " is at capacity (" + subject.getCapacity() + ").");
-        }
+            if (subject.getEnrolledStudentIds().contains(studentId)) {
+                return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_DUPLICATE_ENROLMENT,
+                        "Student " + studentId + " is already enrolled in " + subjectCode + ".");
+            }
+            if (subject.getEnrolledCount() >= subject.getCapacity()) {
+                return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_FULL,
+                        subjectCode + " is at capacity (" + subject.getCapacity() + ").");
+            }
 
-        subject.getEnrolledStudentIds().add(studentId);
-        return ProtocolMessage.successResponse();
+            subject.getEnrolledStudentIds().add(studentId);
+            return ProtocolMessage.successResponse();
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     private ProtocolMessage withdraw(String subjectCode, String studentId) {
         Subject subject = subjects.get(subjectCode);
         if (subject == null) return notFound(subjectCode);
 
-        pause();
+        Lock writeLock = subject.getLock().writeLock();
+        writeLock.lock();
+        try {
+            pause();
 
-        if (!subject.getEnrolledStudentIds().remove(studentId)) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
-                    "Student " + studentId + " is not enrolled in " + subjectCode + ".");
+            if (!subject.getEnrolledStudentIds().remove(studentId)) {
+                return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
+                        "Student " + studentId + " is not enrolled in " + subjectCode + ".");
+            }
+            return ProtocolMessage.successResponse();
+        } finally {
+            writeLock.unlock();
         }
-        return ProtocolMessage.successResponse();
     }
 
     /**
-     * Moves a student from one subject to another. The checks below run in
-     * the order the specification mandates: NOT_FOUND, INVALID_REQUEST,
-     * NOT_ENROLLED, DUPLICATE_ENROLMENT, FULL.
+     * Moves a student from one subject to another under both subjects' write
+     * locks, so no other client can observe the student in both subjects or
+     * in neither.
+     *
+     * The two locks are taken in ascending subjectCode order rather than
+     * source-then-destination order. Two clients transferring between the
+     * same pair of subjects in opposite directions therefore queue for the
+     * same lock first instead of each holding the one the other needs.
+     *
+     * The checks below run in the order the specification mandates:
+     * NOT_FOUND, INVALID_REQUEST, NOT_ENROLLED, DUPLICATE_ENROLMENT, FULL.
      */
     private ProtocolMessage transfer(String fromSubjectCode, String toSubjectCode, String studentId) {
         Subject from = subjects.get(fromSubjectCode);
@@ -455,44 +496,69 @@ public class SubjectServer {
                     "Cannot transfer a student from " + fromSubjectCode + " to itself.");
         }
 
-        pause();
+        // Consistent global lock order: lower subjectCode first, whichever
+        // end of the transfer it happens to be.
+        boolean fromIsFirst = fromSubjectCode.compareTo(toSubjectCode) < 0;
+        Subject firstLocked = fromIsFirst ? from : to;
+        Subject secondLocked = fromIsFirst ? to : from;
 
-        if (!from.getEnrolledStudentIds().contains(studentId)) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
-                    "Student " + studentId + " is not enrolled in " + fromSubjectCode + ".");
-        }
-        if (to.getEnrolledStudentIds().contains(studentId)) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_DUPLICATE_ENROLMENT,
-                    "Student " + studentId + " is already enrolled in " + toSubjectCode + ".");
-        }
-        if (to.getEnrolledCount() >= to.getCapacity()) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_FULL,
-                    toSubjectCode + " is at capacity (" + to.getCapacity() + ").");
-        }
+        Lock firstLock = firstLocked.getLock().writeLock();
+        Lock secondLock = secondLocked.getLock().writeLock();
 
-        from.getEnrolledStudentIds().remove(studentId);
-        to.getEnrolledStudentIds().add(studentId);
-        return ProtocolMessage.successResponse();
+        firstLock.lock();
+        try {
+            secondLock.lock();
+            try {
+                pause();
+
+                if (!from.getEnrolledStudentIds().contains(studentId)) {
+                    return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
+                            "Student " + studentId + " is not enrolled in " + fromSubjectCode + ".");
+                }
+                if (to.getEnrolledStudentIds().contains(studentId)) {
+                    return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_DUPLICATE_ENROLMENT,
+                            "Student " + studentId + " is already enrolled in " + toSubjectCode + ".");
+                }
+                if (to.getEnrolledCount() >= to.getCapacity()) {
+                    return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_FULL,
+                            toSubjectCode + " is at capacity (" + to.getCapacity() + ").");
+                }
+
+                from.getEnrolledStudentIds().remove(studentId);
+                to.getEnrolledStudentIds().add(studentId);
+                return ProtocolMessage.successResponse();
+            } finally {
+                secondLock.unlock();
+            }
+        } finally {
+            firstLock.unlock();
+        }
     }
 
     private ProtocolMessage updateCapacity(String subjectCode, int newCapacity) {
         Subject subject = subjects.get(subjectCode);
         if (subject == null) return notFound(subjectCode);
 
-        pause();
+        Lock writeLock = subject.getLock().writeLock();
+        writeLock.lock();
+        try {
+            pause();
 
-        if (newCapacity <= 0) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
-                    "newCapacity must be a positive integer (got " + newCapacity + ").");
-        }
-        if (newCapacity < subject.getEnrolledCount()) {
-            return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
-                    "newCapacity " + newCapacity + " is below the current enrolment of "
-                            + subject.getEnrolledCount() + " in " + subjectCode + ".");
-        }
+            if (newCapacity <= 0) {
+                return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
+                        "newCapacity must be a positive integer (got " + newCapacity + ").");
+            }
+            if (newCapacity < subject.getEnrolledCount()) {
+                return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_INVALID_REQUEST,
+                        "newCapacity " + newCapacity + " is below the current enrolment of "
+                                + subject.getEnrolledCount() + " in " + subjectCode + ".");
+            }
 
-        subject.setCapacity(newCapacity);
-        return ProtocolMessage.successResponse();
+            subject.setCapacity(newCapacity);
+            return ProtocolMessage.successResponse();
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     private static ProtocolMessage notFound(String subjectCode) {
@@ -505,9 +571,13 @@ public class SubjectServer {
     // ====================================================================
 
     /**
-     * The mandated artificial delay. It sits between resolving the subject(s)
-     * an operation touches and actually reading or mutating them, so that
-     * once locking is in place the delay elapses while the locks are held.
+     * The mandated artificial delay. Every operation calls this after
+     * acquiring its lock(s) and before touching any subject state, so the
+     * delay always elapses with the locks held. That is what makes
+     * contention observable: an operation that has to wait for a lock is
+     * measurably delayed rather than overlapping in the same window. The
+     * response is written by the connection handler, after process() has
+     * returned and the locks have been released.
      */
     private void pause() {
         if (delayMs <= 0) return;
