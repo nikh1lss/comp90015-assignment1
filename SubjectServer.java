@@ -7,12 +7,16 @@ import java.io.OutputStreamWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +38,11 @@ import java.util.concurrent.locks.Lock;
  * a subject excludes everything else on it, and work on different subjects
  * never contends. TRANSFER takes both write locks in ascending subjectCode
  * order so that opposing transfers cannot deadlock.
+ *
+ * Every successful write is saved to a server-managed state file before its
+ * response is sent, so a client that has been told SUCCESS can rely on that
+ * change surviving a crash. On startup the state file is preferred over the
+ * original subject data file.
  *
  * Usage:
  *   java -jar SubjectServer.jar <port> <subject-data-file> <artificial-delay-ms>
@@ -69,9 +78,30 @@ public class SubjectServer {
     /** The listening socket, closed by the console's quit command. */
     private ServerSocket serverSocket;
 
-    private SubjectServer(Map<String, Subject> subjects, int delayMs) {
+    /** The server-managed file that state is saved to and restored from. */
+    private final Path stateFile;
+
+    /** Guards persistedView and serialises writes to the state file. */
+    private final Object persistMonitor = new Object();
+
+    /**
+     * subjectCode -> the last committed snapshot of that subject, as the
+     * JSON object it is stored as. A subject's entry is replaced while its
+     * write lock is still held, so entries for one subject are recorded in
+     * commit order; the file is then rewritten in full from this view. That
+     * keeps the saved copy of a TRANSFER's two subjects consistent, which
+     * reading the live subjects at save time could not guarantee.
+     */
+    private final Map<String, Object> persistedView = new LinkedHashMap<>();
+
+    private SubjectServer(Map<String, Subject> subjects, int delayMs, Path stateFile) {
         this.subjects = subjects;
         this.delayMs = delayMs;
+        this.stateFile = stateFile;
+        // Single-threaded at this point, so no locking is needed here.
+        for (Subject subject : subjects.values()) {
+            persistedView.put(subject.getSubjectCode(), snapshot(subject));
+        }
     }
 
     public static void main(String[] args) {
@@ -105,11 +135,21 @@ public class SubjectServer {
             return;
         }
 
-        // ==================== Load the subject data file (partly provided) ====================
-        Map<String, Subject> subjects = loadSubjects(subjectDataFile);
-        System.out.println("Loaded " + subjects.size() + " subject(s) from " + subjectDataFile);
+        // ==================== Load state (partly provided) ====================
+        // A state file left by an earlier run wins: it holds every write
+        // that completed since the subject data file was first loaded.
+        Path stateFile = stateFileFor(subjectDataFile);
+        Map<String, Subject> subjects;
+        if (Files.isRegularFile(stateFile)) {
+            subjects = loadSubjects(stateFile.toString(), "state file");
+            System.out.println("Restored " + subjects.size() + " subject(s) from " + stateFile);
+        } else {
+            subjects = loadSubjects(subjectDataFile, "subject data file");
+            System.out.println("Loaded " + subjects.size() + " subject(s) from " + subjectDataFile);
+            System.out.println("State will be saved to " + stateFile);
+        }
 
-        new SubjectServer(subjects, delayMs).run(port);
+        new SubjectServer(subjects, delayMs, stateFile).run(port);
     }
 
     // ====================================================================
@@ -130,8 +170,9 @@ public class SubjectServer {
                 + " with an artificial delay of " + delayMs + " ms per operation.");
         System.out.println("Console commands: status | quit");
 
+        // Not a daemon: quit runs its shutdown on this thread, and the JVM
+        // must not exit out from under it once the last client has gone.
         Thread console = new Thread(this::runConsole, "console");
-        console.setDaemon(true);
         console.start();
 
         acceptConnections();
@@ -334,7 +375,9 @@ public class SubjectServer {
             }
         }
 
-        // TODO: persist final state here once persistence is implemented.
+        if (persist()) {
+            System.out.println("Final state saved to " + stateFile);
+        }
 
         System.out.println("Server stopped.");
         System.exit(0);
@@ -397,8 +440,23 @@ public class SubjectServer {
                     ProtocolMessage.STATUS_ERROR, "Server error: " + e);
         }
 
+        // Save before the handler sends the response, so a client that is
+        // told SUCCESS can rely on the change having reached durable storage.
+        if (isWrite(op) && ProtocolMessage.STATUS_SUCCESS.equals(response.getStatus())
+                && !persist()) {
+            response = ProtocolMessage.errorResponse(ProtocolMessage.STATUS_ERROR,
+                    "The change was applied but could not be saved to durable storage.");
+        }
+
         log(op, subjectCode, response.getStatus());
         return response;
+    }
+
+    private static boolean isWrite(String op) {
+        return ProtocolMessage.OP_ENROL.equals(op)
+                || ProtocolMessage.OP_WITHDRAW.equals(op)
+                || ProtocolMessage.OP_TRANSFER.equals(op)
+                || ProtocolMessage.OP_UPDATE_CAPACITY.equals(op);
     }
 
     // ====================================================================
@@ -447,6 +505,7 @@ public class SubjectServer {
             }
 
             subject.getEnrolledStudentIds().add(studentId);
+            recordState(subject);
             return ProtocolMessage.successResponse();
         } finally {
             writeLock.unlock();
@@ -466,6 +525,7 @@ public class SubjectServer {
                 return ProtocolMessage.errorResponse(ProtocolMessage.STATUS_NOT_ENROLLED,
                         "Student " + studentId + " is not enrolled in " + subjectCode + ".");
             }
+            recordState(subject);
             return ProtocolMessage.successResponse();
         } finally {
             writeLock.unlock();
@@ -526,6 +586,10 @@ public class SubjectServer {
 
                 from.getEnrolledStudentIds().remove(studentId);
                 to.getEnrolledStudentIds().add(studentId);
+                // Both snapshots are taken with both write locks held, so the
+                // saved copy can never show the student in both or neither.
+                recordState(from);
+                recordState(to);
                 return ProtocolMessage.successResponse();
             } finally {
                 secondLock.unlock();
@@ -555,6 +619,7 @@ public class SubjectServer {
             }
 
             subject.setCapacity(newCapacity);
+            recordState(subject);
             return ProtocolMessage.successResponse();
         } finally {
             writeLock.unlock();
@@ -588,6 +653,75 @@ public class SubjectServer {
         }
     }
 
+    // ====================================================================
+    // Persistence
+    // ====================================================================
+
+    /**
+     * The state file for a given subject data file: the same directory, with
+     * "-state.json" in place of the data file's own ".json". Deriving it this
+     * way keeps each data file's saved state beside it instead of in a fixed
+     * location two servers would fight over.
+     */
+    private static Path stateFileFor(String subjectDataFile) {
+        Path dataFile = Paths.get(subjectDataFile).toAbsolutePath();
+        String name = dataFile.getFileName().toString();
+        if (name.endsWith(".json")) {
+            name = name.substring(0, name.length() - ".json".length());
+        }
+        Path directory = dataFile.getParent();
+        String stateName = name + "-state.json";
+        return directory == null ? Paths.get(stateName) : directory.resolve(stateName);
+    }
+
+    /** One subject as the JSON object it is stored as. Call under its lock. */
+    private static Map<String, Object> snapshot(Subject subject) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("subjectCode", subject.getSubjectCode());
+        entry.put("capacity", subject.getCapacity());
+        entry.put("enrolledStudentIds", new ArrayList<>(subject.getEnrolledStudentIds()));
+        return entry;
+    }
+
+    /**
+     * Records a subject's newly committed state. Must be called while still
+     * holding that subject's write lock, so that concurrent writes to one
+     * subject are recorded in the order they committed.
+     */
+    private void recordState(Subject subject) {
+        Map<String, Object> snapshot = snapshot(subject);
+        synchronized (persistMonitor) {
+            persistedView.put(subject.getSubjectCode(), snapshot);
+        }
+    }
+
+    /**
+     * Rewrites the state file from the recorded view. Encoding and writing
+     * happen under the same monitor so two concurrent saves cannot land out
+     * of order; the write goes to a temporary file that replaces the state
+     * file atomically, so a crash mid-save cannot leave a half-written file
+     * behind. Returns false, having reported the problem, if the save failed.
+     */
+    private boolean persist() {
+        synchronized (persistMonitor) {
+            String json = SimpleJson.encode(new ArrayList<Object>(persistedView.values()));
+            Path temporary = stateFile.resolveSibling(stateFile.getFileName() + ".tmp");
+            try {
+                Files.write(temporary, json.getBytes(StandardCharsets.UTF_8));
+                try {
+                    Files.move(temporary, stateFile,
+                            StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(temporary, stateFile, StandardCopyOption.REPLACE_EXISTING);
+                }
+                return true;
+            } catch (IOException e) {
+                System.err.println("Could not save state to " + stateFile + ": " + e.getMessage());
+                return false;
+            }
+        }
+    }
+
     /** One operational log line per completed operation. */
     private static void log(String op, String subjectCode, String status) {
         System.out.println(LocalDateTime.now().format(LOG_TIMESTAMP)
@@ -604,17 +738,18 @@ public class SubjectServer {
     }
 
     /**
-     * Reads the subject data file, decodes it as JSON, and returns a
-     * subjectCode -> Subject map. Exits the process with a clear error
+     * Reads a subject file (the original data file or the state file),
+     * decodes it as JSON, and returns a subjectCode -> Subject map. The
+     * description names which kind of file it is, for error messages. Exits the process with a clear error
      * message (and non-zero status) on any failure, per the Subject Data
      * File Format section.
      */
-    private static Map<String, Subject> loadSubjects(String path) {
+    private static Map<String, Subject> loadSubjects(String path, String description) {
         String text;
         try {
             text = new String(Files.readAllBytes(Paths.get(path)));
         } catch (IOException e) {
-            System.err.println("Could not read subject data file '" + path + "': " + e.getMessage());
+            System.err.println("Could not read " + description + " '" + path + "': " + e.getMessage());
             System.exit(1);
             return null; // unreachable, System.exit terminates the JVM
         }
@@ -623,13 +758,13 @@ public class SubjectServer {
         try {
             decoded = SimpleJson.decode(text);
         } catch (SimpleJson.JsonParseException e) {
-            System.err.println("Subject data file '" + path + "' is not valid JSON: " + e.getMessage());
+            System.err.println(capitalise(description) + " '" + path + "' is not valid JSON: " + e.getMessage());
             System.exit(1);
             return null; // unreachable
         }
 
         if (!(decoded instanceof List)) {
-            System.err.println("Subject data file '" + path + "' must contain a JSON array at the top level.");
+            System.err.println(capitalise(description) + " '" + path + "' must contain a JSON array at the top level.");
             System.exit(1);
             return null; // unreachable
         }
@@ -638,7 +773,7 @@ public class SubjectServer {
 
         int index = 0;
         for (Object item : (List<?>) decoded) {
-            String where = "Entry " + index + " of subject data file '" + path + "'";
+            String where = "Entry " + index + " of " + description + " '" + path + "'";
             index++;
 
             if (!(item instanceof Map)) {
@@ -695,6 +830,10 @@ public class SubjectServer {
      * Reports a fatal subject data file problem and terminates the JVM with a
      * non-zero status, as the Subject Data File Format section requires.
      */
+    private static String capitalise(String text) {
+        return text.isEmpty() ? text : Character.toUpperCase(text.charAt(0)) + text.substring(1);
+    }
+
     private static void fail(String message) {
         System.err.println(message);
         System.exit(1);
