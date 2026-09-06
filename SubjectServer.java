@@ -26,8 +26,9 @@ import java.util.Set;
  * ENROL, WITHDRAW, TRANSFER, UPDATE_CAPACITY) are dispatched from
  * {@link #process(String)} to a handler each.
  *
- * Connections are currently served one at a time on the accept thread, and
- * the shared subject state is not yet guarded by any locking.
+ * Each accepted connection is handed to its own thread, which serves that
+ * client until it disconnects (thread-per-connection). The shared subject
+ * state is not yet guarded by any locking.
  *
  * Usage:
  *   java -jar SubjectServer.jar <port> <subject-data-file> <artificial-delay-ms>
@@ -42,6 +43,20 @@ public class SubjectServer {
 
     /** Artificial delay applied to every operation, in milliseconds. */
     private final int delayMs;
+
+    /**
+     * Guards every field below it: the live connection set, the in-flight
+     * operation count, the connection id counter and the shutdown flag.
+     */
+    private final Object monitor = new Object();
+
+    private final Set<ConnectionHandler> activeConnections = new LinkedHashSet<>();
+    private int inFlightOperations = 0;
+    private int nextConnectionId = 1;
+    private boolean shuttingDown = false;
+
+    /** The listening socket, closed by the console's quit command. */
+    private ServerSocket serverSocket;
 
     private SubjectServer(Map<String, Subject> subjects, int delayMs) {
         this.subjects = subjects;
@@ -92,7 +107,6 @@ public class SubjectServer {
 
     /** Binds the listening socket and serves connections until it is closed. */
     private void run(int port) {
-        ServerSocket serverSocket;
         try {
             serverSocket = new ServerSocket(port);
         } catch (IOException e) {
@@ -103,16 +117,44 @@ public class SubjectServer {
 
         System.out.println("Listening on port " + serverSocket.getLocalPort()
                 + " with an artificial delay of " + delayMs + " ms per operation.");
+        System.out.println("Console commands: status | quit");
 
-        try {
-            while (true) {
-                Socket socket = serverSocket.accept();
-                serveConnection(socket);
+        Thread console = new Thread(this::runConsole, "console");
+        console.setDaemon(true);
+        console.start();
+
+        acceptConnections();
+    }
+
+    /**
+     * Accepts connections until the listening socket is closed, giving each
+     * one its own thread so that slow operations on one connection never
+     * hold up another.
+     */
+    private void acceptConnections() {
+        while (true) {
+            Socket socket;
+            try {
+                socket = serverSocket.accept();
+            } catch (IOException e) {
+                if (isShuttingDown()) return; // quit closed the listening socket
+                System.err.println("Stopped accepting connections: " + e.getMessage());
+                return;
             }
-        } catch (IOException e) {
-            System.err.println("Stopped accepting connections: " + e.getMessage());
-        } finally {
-            closeQuietly(serverSocket);
+
+            ConnectionHandler handler;
+            synchronized (monitor) {
+                if (shuttingDown) {
+                    closeQuietly(socket);
+                    return;
+                }
+                handler = new ConnectionHandler(socket, nextConnectionId++);
+                activeConnections.add(handler);
+            }
+
+            Thread thread = new Thread(handler, "client-" + handler.id);
+            handler.thread = thread;
+            thread.start();
         }
     }
 
@@ -121,30 +163,170 @@ public class SubjectServer {
      * line, write a response line, repeat until the client disconnects.
      *
      * A bad request is answered and the connection kept open; only an I/O
-     * failure or the client hanging up ends the loop.
+     * failure, the client hanging up, or server shutdown ends the loop.
      */
-    private void serveConnection(Socket socket) {
-        String peer = String.valueOf(socket.getRemoteSocketAddress());
-        System.out.println("Client connected: " + peer);
-        try {
-            BufferedReader in = new BufferedReader(
-                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            BufferedWriter out = new BufferedWriter(
-                    new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+    private final class ConnectionHandler implements Runnable {
 
+        private final Socket socket;
+        private final int id;
+        private volatile Thread thread;
+
+        ConnectionHandler(Socket socket, int id) {
+            this.socket = socket;
+            this.id = id;
+        }
+
+        @Override
+        public void run() {
+            String peer = String.valueOf(socket.getRemoteSocketAddress());
+            System.out.println("Client " + id + " connected from " + peer);
+            try {
+                BufferedReader in = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                BufferedWriter out = new BufferedWriter(
+                        new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+
+                String line;
+                while ((line = in.readLine()) != null) {
+                    // Registering the operation first is what lets quit wait
+                    // for it: once shutdown has begun, no new one starts.
+                    if (!beginOperation()) break;
+                    try {
+                        ProtocolMessage response = process(line);
+                        out.write(response.toJson());
+                        out.write("\n");
+                        out.flush();
+                    } finally {
+                        endOperation();
+                    }
+                }
+            } catch (IOException e) {
+                if (!isShuttingDown()) {
+                    System.err.println("Connection to " + peer + " failed: " + e.getMessage());
+                }
+            } finally {
+                closeQuietly(socket);
+                synchronized (monitor) {
+                    activeConnections.remove(this);
+                }
+                System.out.println("Client " + id + " disconnected");
+            }
+        }
+
+        /** Closes this connection, unblocking a handler waiting on readLine. */
+        void close() {
+            closeQuietly(socket);
+        }
+    }
+
+    /**
+     * Claims a slot for one operation, or returns false if the server is
+     * shutting down and the handler should stop reading requests.
+     */
+    private boolean beginOperation() {
+        synchronized (monitor) {
+            if (shuttingDown) return false;
+            inFlightOperations++;
+            return true;
+        }
+    }
+
+    private void endOperation() {
+        synchronized (monitor) {
+            inFlightOperations--;
+            monitor.notifyAll();
+        }
+    }
+
+    private boolean isShuttingDown() {
+        synchronized (monitor) {
+            return shuttingDown;
+        }
+    }
+
+    // ====================================================================
+    // Server console
+    // ====================================================================
+
+    /**
+     * Reads console commands from standard input. End of input simply ends
+     * the console; the server keeps serving clients, since a server started
+     * without a terminal attached should not shut itself down.
+     */
+    private void runConsole() {
+        BufferedReader stdin = new BufferedReader(
+                new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        try {
             String line;
-            while ((line = in.readLine()) != null) {
-                ProtocolMessage response = process(line);
-                out.write(response.toJson());
-                out.write("\n");
-                out.flush();
+            while ((line = stdin.readLine()) != null) {
+                String command = line.trim().toLowerCase();
+                if (command.isEmpty()) continue;
+
+                if (command.equals("status")) {
+                    printStatus();
+                } else if (command.equals("quit") || command.equals("stop")) {
+                    shutdown();
+                    return;
+                } else {
+                    System.out.println("Unknown command '" + command + "'. Try: status | quit");
+                }
             }
         } catch (IOException e) {
-            System.err.println("Connection to " + peer + " failed: " + e.getMessage());
-        } finally {
-            closeQuietly(socket);
-            System.out.println("Client disconnected: " + peer);
+            System.err.println("Console input closed: " + e.getMessage());
         }
+    }
+
+    private void printStatus() {
+        synchronized (monitor) {
+            System.out.println(activeConnections.size() + " active client connection(s), "
+                    + inFlightOperations + " operation(s) in flight.");
+        }
+    }
+
+    /**
+     * Stops accepting new connections, waits for the operations already
+     * under way to finish answering their clients, then closes the
+     * remaining connections and exits.
+     */
+    private void shutdown() {
+        System.out.println("Shutting down; no new connections will be accepted.");
+
+        List<ConnectionHandler> remaining;
+        synchronized (monitor) {
+            shuttingDown = true;
+        }
+        closeQuietly(serverSocket); // unblocks accept()
+
+        synchronized (monitor) {
+            while (inFlightOperations > 0) {
+                try {
+                    monitor.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            remaining = new ArrayList<>(activeConnections);
+        }
+
+        for (ConnectionHandler handler : remaining) {
+            handler.close();
+        }
+        for (ConnectionHandler handler : remaining) {
+            Thread thread = handler.thread;
+            if (thread == null) continue;
+            try {
+                thread.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        // TODO: persist final state here once persistence is implemented.
+
+        System.out.println("Server stopped.");
+        System.exit(0);
     }
 
     /**
